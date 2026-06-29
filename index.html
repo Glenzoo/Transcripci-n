@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Extractor de Transcripciones YouTube</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: #0f0f0f;
+  color: #e0e0e0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  min-height: 100vh;
+  padding: 24px 16px;
+}
+
+.container {
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+h1 {
+  font-size: 1.6rem;
+  font-weight: 700;
+  color: #e0e0e0;
+  margin-bottom: 28px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+h1::before {
+  content: '';
+  display: inline-block;
+  width: 4px;
+  height: 28px;
+  background: #7c3aed;
+  border-radius: 2px;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid #2a2a2a;
+  padding-bottom: 0;
+}
+
+.tab-btn {
+  padding: 10px 20px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: #888;
+  font-size: 0.95rem;
+  cursor: pointer;
+  transition: color 0.2s, border-color 0.2s;
+  margin-bottom: -1px;
+}
+
+.tab-btn:hover { color: #e0e0e0; }
+
+.tab-btn.active {
+  color: #7c3aed;
+  border-bottom-color: #7c3aed;
+  font-weight: 600;
+}
+
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+.surface {
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+  border-radius: 10px;
+  padding: 20px;
+  margin-bottom: 16px;
+}
+
+textarea, input[type="text"] {
+  width: 100%;
+  background: #0f0f0f;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  color: #e0e0e0;
+  font-size: 0.9rem;
+  padding: 12px 14px;
+  resize: vertical;
+  font-family: inherit;
+  transition: border-color 0.2s;
+  outline: none;
+}
+
+textarea { min-height: 220px; }
+input[type="text"] { height: 44px; }
+
+textarea:focus, input[type="text"]:focus {
+  border-color: #7c3aed;
+}
+
+textarea::placeholder, input[type="text"]::placeholder {
+  color: #555;
+}
+
+.validation-msg {
+  color: #ef4444;
+  font-size: 0.82rem;
+  margin-top: 8px;
+  display: none;
+}
+
+.validation-msg.visible { display: block; }
+
+.btn-primary {
+  width: 100%;
+  padding: 13px;
+  background: #7c3aed;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, opacity 0.2s;
+  margin-top: 4px;
+}
+
+.btn-primary:hover:not(:disabled) { background: #6d28d9; }
+.btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.progress-section {
+  display: none;
+  margin-bottom: 16px;
+}
+
+.progress-section.visible { display: block; }
+
+.progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 0.88rem;
+  color: #aaa;
+}
+
+.progress-bar-track {
+  width: 100%;
+  height: 6px;
+  background: #2a2a2a;
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background: #7c3aed;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+  width: 0%;
+}
+
+.processing-label {
+  font-size: 0.85rem;
+  color: #aaa;
+  margin-bottom: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.log-box {
+  background: #0f0f0f;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  padding: 10px 14px;
+  height: 160px;
+  overflow-y: auto;
+  font-size: 0.8rem;
+  font-family: 'Courier New', monospace;
+  color: #999;
+}
+
+.log-entry { line-height: 1.6; }
+.log-entry.ok { color: #22c55e; }
+.log-entry.err { color: #ef4444; }
+.log-entry.info { color: #aaa; }
+
+.results-section {
+  display: none;
+  margin-bottom: 16px;
+}
+
+.results-section.visible { display: block; }
+
+.summary-line {
+  font-size: 0.95rem;
+  margin-bottom: 14px;
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.summary-ok { color: #22c55e; font-weight: 600; }
+.summary-err { color: #ef4444; font-weight: 600; }
+
+.results-table-wrap {
+  overflow-x: auto;
+  margin-bottom: 16px;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+thead th {
+  background: #1a1a1a;
+  padding: 10px 14px;
+  text-align: left;
+  color: #888;
+  font-weight: 600;
+  border-bottom: 1px solid #2a2a2a;
+}
+
+tbody tr { border-bottom: 1px solid #1e1e1e; }
+tbody tr:last-child { border-bottom: none; }
+
+tbody td {
+  padding: 9px 14px;
+  background: #141414;
+  vertical-align: middle;
+}
+
+tbody tr:hover td { background: #181818; }
+
+td.status-ok { color: #22c55e; font-size: 1rem; }
+td.status-err { color: #ef4444; font-size: 1rem; }
+
+.btn-download {
+  width: 100%;
+  padding: 13px;
+  background: #22c55e;
+  color: #000;
+  border: none;
+  border-radius: 8px;
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.btn-download:hover { background: #16a34a; }
+
+.no-videos-msg {
+  color: #ef4444;
+  font-size: 0.9rem;
+  padding: 10px 0;
+  display: none;
+}
+
+.no-videos-msg.visible { display: block; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Extractor de Transcripciones YouTube</h1>
+
+  <div class="surface">
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="videos">Videos individuales</button>
+      <button class="tab-btn" data-tab="playlist">Playlist</button>
+    </div>
+
+    <div id="tab-videos" class="tab-panel active">
+      <textarea id="urls-input" placeholder="Pega aquí las URLs de YouTube, una por línea"></textarea>
+      <div class="validation-msg" id="videos-validation">Por favor, introduce al menos una URL válida.</div>
+    </div>
+
+    <div id="tab-playlist" class="tab-panel">
+      <input type="text" id="playlist-input" placeholder="https://www.youtube.com/playlist?list=...">
+      <div class="validation-msg" id="playlist-validation">Por favor, introduce una URL de playlist válida.</div>
+      <div class="no-videos-msg" id="no-videos-msg">No se encontraron videos en esta playlist.</div>
+    </div>
+
+    <button class="btn-primary" id="start-btn">Iniciar extracción</button>
+  </div>
+
+  <div class="surface progress-section" id="progress-section">
+    <div class="progress-header">
+      <span id="progress-count">0 / 0 videos</span>
+    </div>
+    <div class="progress-bar-track">
+      <div class="progress-bar-fill" id="progress-bar"></div>
+    </div>
+    <div class="processing-label" id="processing-label">Iniciando...</div>
+    <div class="log-box" id="log-box"></div>
+  </div>
+
+  <div class="surface results-section" id="results-section">
+    <div class="summary-line" id="summary-line"></div>
+    <div class="results-table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Título</th>
+            <th>Estado</th>
+            <th>Caracteres</th>
+          </tr>
+        </thead>
+        <tbody id="results-tbody"></tbody>
+      </table>
+    </div>
+    <button class="btn-download" id="download-btn">Descargar ZIP</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  const PROXY_PRIMARY = 'https://corsproxy.io/?url=';
+  const PROXY_FALLBACK = 'https://api.allorigins.win/raw?url=';
+  const DELAY_MS = 500;
+  const ERROR_TEXT = 'No se ha podido extraer la transcripción de este video.';
+
+  let activeTab = 'videos';
+  let isProcessing = false;
+  let zipData = null;
+  let resultsData = [];
+
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      activeTab = btn.dataset.tab;
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById('tab-' + activeTab).classList.add('active');
+      hideValidation();
+    });
+  });
+
+  document.getElementById('start-btn').addEventListener('click', startExtraction);
+  document.getElementById('download-btn').addEventListener('click', downloadZip);
+
+  function hideValidation() {
+    document.getElementById('videos-validation').classList.remove('visible');
+    document.getElementById('playlist-validation').classList.remove('visible');
+    document.getElementById('no-videos-msg').classList.remove('visible');
+  }
+
+  function parseVideoId(url) {
+    url = url.trim();
+    if (!url) return null;
+    try {
+      const u = new URL(url);
+      const host = u.hostname.replace('www.', '');
+      if (host === 'youtu.be') return u.pathname.slice(1).split('/')[0] || null;
+      if (host === 'youtube.com') {
+        if (u.pathname.startsWith('/watch')) return u.searchParams.get('v') || null;
+        if (u.pathname.startsWith('/shorts/')) return u.pathname.split('/')[2] || null;
+        if (u.pathname.startsWith('/embed/')) return u.pathname.split('/')[2] || null;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function parsePlaylistId(url) {
+    url = url.trim();
+    if (!url) return null;
+    try {
+      const u = new URL(url);
+      return u.searchParams.get('list') || null;
+    } catch (_) {}
+    return null;
+  }
+
+  async function fetchWithProxy(targetUrl) {
+    const encoded = encodeURIComponent(targetUrl);
+    try {
+      const res = await fetch(PROXY_PRIMARY + encoded);
+      if (res.ok) return await res.text();
+    } catch (_) {}
+    try {
+      const res = await fetch(PROXY_FALLBACK + encoded);
+      if (res.ok) return await res.text();
+    } catch (_) {}
+    throw new Error('Ambos proxies fallaron para: ' + targetUrl);
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function decodeHtmlEntities(str) {
+    return str
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&apos;/g, "'")
+      .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+      .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+  }
+
+  function sanitizeTitle(title) {
+    return title
+      .replace(/[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑüÜ\s]/g, '')
+      .trim()
+      .replace(/\s+/g, '_')
+      .slice(0, 60);
+  }
+
+  function extractJsonBlock(html, varName) {
+    const re = new RegExp(varName + '\\s*=\\s*(\\{)');
+    const match = re.exec(html);
+    if (!match) return null;
+    let start = match.index + match[0].length - 1;
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let i = start;
+    while (i < html.length) {
+      const ch = html[i];
+      if (escape) { escape = false; i++; continue; }
+      if (ch === '\\' && inString) { escape = true; i++; continue; }
+      if (ch === '"' && !escape) { inString = !inString; i++; continue; }
+      if (!inString) {
+        if (ch === '{') depth++;
+        else if (ch === '}') { depth--; if (depth === 0) { i++; break; } }
+      }
+      i++;
+    }
+    try {
+      return JSON.parse(html.slice(start, i));
+    } catch (_) {
+      try {
+        const re2 = new RegExp(varName + '\\s*=\\s*(\\{.+?\\})\\s*;');
+        const m2 = re2.exec(html);
+        if (m2) return JSON.parse(m2[1]);
+      } catch (_2) {}
+      return null;
+    }
+  }
+
+  function collectVideoIds(obj, ids) {
+    if (!obj || typeof obj !== 'object') return;
+    if (Array.isArray(obj)) {
+      for (const item of obj) collectVideoIds(item, ids);
+      return;
+    }
+    if (obj.videoId && typeof obj.videoId === 'string') {
+      ids.add(obj.videoId);
+    }
+    for (const key of Object.keys(obj)) {
+      if (key !== 'videoId') collectVideoIds(obj[key], ids);
+    }
+  }
+
+  async function fetchPlaylistVideoIds(playlistId) {
+    const ids = new Set();
+    const url = 'https://www.youtube.com/playlist?list=' + playlistId;
+    const html = await fetchWithProxy(url);
+    const data = extractJsonBlock(html, 'ytInitialData');
+    if (!data) throw new Error('ytInitialData no encontrado en la playlist');
+
+    collectVideoIds(data, ids);
+
+    let continuation = findContinuationToken(data);
+    while (continuation) {
+      await sleep(DELAY_MS);
+      const contData = await fetchContinuation(continuation);
+      if (!contData) break;
+      collectVideoIds(contData, ids);
+      continuation = findContinuationToken(contData);
+    }
+
+    return Array.from(ids);
+  }
+
+  function findContinuationToken(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        const r = findContinuationToken(item);
+        if (r) return r;
+      }
+      return null;
+    }
+    if (obj.continuationItemRenderer) {
+      const cr = obj.continuationItemRenderer;
+      try {
+        return cr.continuationEndpoint.continuationCommand.token
+          || cr.continuationEndpoint.continuationCommand.continuation
+          || null;
+      } catch (_) {}
+    }
+    for (const key of Object.keys(obj)) {
+      const r = findContinuationToken(obj[key]);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  async function fetchContinuation(token) {
+    const apiUrl = 'https://www.youtube.com/youtubei/v1/browse?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
+    const body = JSON.stringify({
+      continuation: token,
+      context: {
+        client: { clientName: 'WEB', clientVersion: '2.20231121.00.00' }
+      }
+    });
+    try {
+      const encoded = encodeURIComponent(apiUrl);
+      const res = await fetch(PROXY_PRIMARY + encoded, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body
+      });
+      if (res.ok) return await res.json();
+    } catch (_) {}
+    try {
+      const encoded = encodeURIComponent(apiUrl);
+      const res = await fetch(PROXY_FALLBACK + encoded, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body
+      });
+      if (res.ok) return await res.json();
+    } catch (_) {}
+    return null;
+  }
+
+  async function extractTranscript(videoId) {
+    const pageUrl = 'https://www.youtube.com/watch?v=' + videoId;
+    const html = await fetchWithProxy(pageUrl);
+
+    const playerData = extractJsonBlock(html, 'ytInitialPlayerResponse');
+    if (!playerData) throw new Error('ytInitialPlayerResponse no encontrado');
+
+    const tracks =
+      playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+    if (!tracks || tracks.length === 0) throw new Error('Sin pistas de subtítulos');
+
+    const title = playerData?.videoDetails?.title || videoId;
+
+    let track = tracks.find(t => t.kind !== 'asr') || tracks[0];
+    const trackUrl = track.baseUrl;
+    if (!trackUrl) throw new Error('baseUrl no disponible en la pista');
+
+    const xmlText = await fetchWithProxy(trackUrl);
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlText, 'application/xml');
+    const textNodes = doc.querySelectorAll('text');
+    if (textNodes.length === 0) throw new Error('No se encontraron elementos <text> en el XML');
+
+    const transcript = Array.from(textNodes)
+      .map(n => decodeHtmlEntities(n.textContent || '').replace(/\n/g, ' ').trim())
+      .filter(t => t.length > 0)
+      .join(' ');
+
+    return { title, transcript };
+  }
+
+  function appendLog(message, type) {
+    const box = document.getElementById('log-box');
+    const entry = document.createElement('div');
+    entry.className = 'log-entry ' + (type || 'info');
+    entry.textContent = message;
+    box.appendChild(entry);
+    box.scrollTop = box.scrollHeight;
+    while (box.children.length > 50) box.removeChild(box.firstChild);
+  }
+
+  function updateProgress(current, total, label) {
+    document.getElementById('progress-count').textContent = current + ' / ' + total + ' videos';
+    document.getElementById('progress-bar').style.width = (total > 0 ? (current / total) * 100 : 0) + '%';
+    if (label) document.getElementById('processing-label').textContent = 'Procesando: ' + label;
+  }
+
+  async function startExtraction() {
+    if (isProcessing) return;
+    hideValidation();
+
+    let videoIds = [];
+
+    if (activeTab === 'videos') {
+      const raw = document.getElementById('urls-input').value.trim();
+      if (!raw) {
+        document.getElementById('videos-validation').classList.add('visible');
+        return;
+      }
+      const lines = raw.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+      const skipped = [];
+      for (const line of lines) {
+        const id = parseVideoId(line);
+        if (id) {
+          videoIds.push({ id, originalUrl: line });
+        } else {
+          skipped.push(line);
+        }
+      }
+      if (videoIds.length === 0) {
+        document.getElementById('videos-validation').classList.add('visible');
+        return;
+      }
+      const seen = new Set();
+      videoIds = videoIds.filter(v => {
+        if (seen.has(v.id)) return false;
+        seen.add(v.id);
+        return true;
+      });
+      videoIds._skipped = skipped;
+    } else {
+      const raw = document.getElementById('playlist-input').value.trim();
+      const plId = parsePlaylistId(raw);
+      if (!plId) {
+        document.getElementById('playlist-validation').classList.add('visible');
+        return;
+      }
+
+      isProcessing = true;
+      document.getElementById('start-btn').disabled = true;
+      document.getElementById('progress-section').classList.add('visible');
+      document.getElementById('results-section').classList.remove('visible');
+      document.getElementById('log-box').innerHTML = '';
+      updateProgress(0, 0, 'Obteniendo lista de videos...');
+      appendLog('Obteniendo videos de la playlist...', 'info');
+
+      let ids;
+      try {
+        ids = await fetchPlaylistVideoIds(plId);
+      } catch (e) {
+        appendLog('Error al obtener playlist: ' + e.message, 'err');
+        isProcessing = false;
+        document.getElementById('start-btn').disabled = false;
+        return;
+      }
+
+      if (ids.length === 0) {
+        document.getElementById('no-videos-msg').classList.add('visible');
+        isProcessing = false;
+        document.getElementById('start-btn').disabled = false;
+        return;
+      }
+
+      videoIds = ids.map(id => ({ id, originalUrl: 'https://www.youtube.com/watch?v=' + id }));
+    }
+
+    isProcessing = true;
+    document.getElementById('start-btn').disabled = true;
+    document.getElementById('progress-section').classList.add('visible');
+    document.getElementById('results-section').classList.remove('visible');
+    document.getElementById('log-box').innerHTML = '';
+    resultsData = [];
+    zipData = null;
+
+    const skipped = videoIds._skipped || [];
+    for (const url of skipped) {
+      appendLog('URL no reconocida: ' + url, 'err');
+    }
+
+    const total = videoIds.length;
+    updateProgress(0, total, '');
+
+    const zip = new JSZip();
+    let okCount = 0;
+    let errCount = 0;
+
+    for (let i = 0; i < videoIds.length; i++) {
+      const { id, originalUrl } = videoIds[i];
+      updateProgress(i, total, originalUrl);
+      appendLog('[' + (i + 1) + '/' + total + '] Procesando: ' + id, 'info');
+
+      try {
+        const { title, transcript } = await extractTranscript(id);
+        const sanitized = sanitizeTitle(title);
+        const fileName = (sanitized || 'video') + '_' + id + '.txt';
+        zip.file(fileName, transcript);
+        okCount++;
+        resultsData.push({ index: i + 1, title: title || id, status: 'ok', chars: transcript.length, id });
+        appendLog('✓ ' + (title || id) + ' (' + transcript.length + ' chars)', 'ok');
+      } catch (e) {
+        const fileName = 'ERROR_' + id + '.txt';
+        zip.file(fileName, ERROR_TEXT);
+        errCount++;
+        resultsData.push({ index: i + 1, title: id, status: 'err', chars: 0, id });
+        appendLog('✗ ' + id + ': ' + e.message, 'err');
+      }
+
+      updateProgress(i + 1, total, i + 1 < total ? videoIds[i + 1].originalUrl : 'Completado');
+
+      if (i < videoIds.length - 1) await sleep(DELAY_MS);
+    }
+
+    zipData = zip;
+    document.getElementById('processing-label').textContent = 'Extracción completada.';
+
+    renderResults(okCount, errCount);
+    isProcessing = false;
+    document.getElementById('start-btn').disabled = false;
+  }
+
+  function renderResults(okCount, errCount) {
+    const summaryEl = document.getElementById('summary-line');
+    summaryEl.innerHTML =
+      '<span class="summary-ok">✓ ' + okCount + ' extraídas correctamente</span>' +
+      '<span class="summary-err">✗ ' + errCount + ' con error</span>';
+
+    const tbody = document.getElementById('results-tbody');
+    tbody.innerHTML = '';
+    for (const row of resultsData) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>' + row.index + '</td>' +
+        '<td>' + escHtml(row.title) + '</td>' +
+        '<td class="status-' + row.status + '">' + (row.status === 'ok' ? '✓' : '✗') + '</td>' +
+        '<td>' + (row.status === 'ok' ? row.chars.toLocaleString() : '—') + '</td>';
+      tbody.appendChild(tr);
+    }
+
+    document.getElementById('results-section').classList.add('visible');
+  }
+
+  function escHtml(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  async function downloadZip() {
+    if (!zipData) return;
+    const now = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const stamp =
+      now.getFullYear() +
+      pad(now.getMonth() + 1) +
+      pad(now.getDate()) + '_' +
+      pad(now.getHours()) +
+      pad(now.getMinutes()) +
+      pad(now.getSeconds());
+    const filename = 'transcripciones_' + stamp + '.zip';
+
+    const blob = await zipData.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+})();
+</script>
+</body>
+</html>
