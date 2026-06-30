@@ -525,6 +525,22 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     );
   }
 
+  function parseVttTranscript(text) {
+    if (!text || !text.includes('WEBVTT')) return null;
+    const parts = [];
+    for (const block of text.split(/\n\n+/)) {
+      if (!block.includes('-->')) continue;
+      const content = block.split('\n')
+        .filter(l => !l.includes('-->') && !l.match(/^\d+$/) && l.trim())
+        .join(' ')
+        .replace(/<[^>]+>/g, '')
+        .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim();
+      if (content) parts.push(content);
+    }
+    const result = parts.join(' ');
+    return result.length > 20 ? result : null;
+  }
+
   function parseJson3Transcript(text) {
     try {
       const data = typeof text === 'string' ? JSON.parse(text) : text;
@@ -539,12 +555,17 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     } catch (_) { return null; }
   }
 
-  function buildTranscriptParams(videoId) {
+  function buildTranscriptParams(videoId, format) {
     const idBytes = new TextEncoder().encode(videoId);
+    if (format === 'nested') {
+      const inner = new Uint8Array(2 + idBytes.length);
+      inner[0] = 0x0a; inner[1] = idBytes.length; inner.set(idBytes, 2);
+      const outer = new Uint8Array(2 + inner.length);
+      outer[0] = 0x0a; outer[1] = inner.length; outer.set(inner, 2);
+      return btoa(String.fromCharCode(...outer));
+    }
     const buf = new Uint8Array(2 + idBytes.length);
-    buf[0] = 0x0a;
-    buf[1] = idBytes.length;
-    buf.set(idBytes, 2);
+    buf[0] = 0x0a; buf[1] = idBytes.length; buf.set(idBytes, 2);
     return btoa(String.fromCharCode(...buf));
   }
 
@@ -573,30 +594,66 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     } catch (_) { return null; }
   }
 
-  async function tryInnertubeTranscript(videoId) {
-    const url = 'https://www.youtube.com/youtubei/v1/get_transcript?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
-    const body = JSON.stringify({
-      context: { client: { clientName: 'WEB', clientVersion: '2.20240101.00.00', hl: 'en', gl: 'US' } },
-      params: buildTranscriptParams(videoId),
-    });
+  async function tryInnertubeTranscript(videoId, visitorData = null) {
+    const url = 'https://www.youtube.com/youtubei/v1/get_transcript';
+    const client = { clientName: 'WEB', clientVersion: '2.9999099', hl: 'en', gl: 'US' };
+    if (visitorData) client.visitorData = visitorData;
     const encoded = encodeURIComponent(url);
-    for (const proxy of POST_PROXIES) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 15000);
+    for (const params of [buildTranscriptParams(videoId, 'nested'), buildTranscriptParams(videoId)]) {
+      const body = JSON.stringify({ context: { client }, params });
+      for (const proxy of POST_PROXIES) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15000);
+        try {
+          const res = await fetch(proxy + encoded, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body,
+            signal: controller.signal,
+          });
+          clearTimeout(timer);
+          if (res.ok) {
+            const data = await res.json();
+            const transcript = parseInnertubeTranscript(data);
+            if (transcript) return transcript;
+          }
+        } catch (_) { clearTimeout(timer); }
+      }
+    }
+    return null;
+  }
+
+  async function tryInvidiousTranscript(videoId) {
+    const instances = [
+      'https://invidious.snopyta.org',
+      'https://yewtu.be',
+      'https://invidious.kavin.rocks',
+      'https://inv.riverside.rocks',
+      'https://invidious.lunar.icu',
+    ];
+    for (const base of instances) {
       try {
-        const res = await fetch(proxy + encoded, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body,
-          signal: controller.signal,
-        });
-        clearTimeout(timer);
-        if (res.ok) {
-          const data = await res.json();
-          const transcript = parseInnertubeTranscript(data);
-          if (transcript) return transcript;
-        }
-      } catch (_) { clearTimeout(timer); }
+        const c = new AbortController();
+        const t = setTimeout(() => c.abort(), 8000);
+        const res = await fetch(base + '/api/v1/captions/' + videoId, { signal: c.signal });
+        clearTimeout(t);
+        if (!res.ok) continue;
+        const data = await res.json();
+        const captions = data.captions || [];
+        if (!captions.length) continue;
+        const cap = captions.find(c => c.languageCode?.startsWith('es') && !c.label?.includes('auto'))
+          || captions.find(c => c.languageCode?.startsWith('es'))
+          || captions[0];
+        if (!cap?.url) continue;
+        const c2 = new AbortController();
+        const t2 = setTimeout(() => c2.abort(), 8000);
+        const cr = await fetch(base + cap.url, { signal: c2.signal });
+        clearTimeout(t2);
+        if (!cr.ok) continue;
+        const text = await cr.text();
+        const transcript = parseTimedtextXml(text) || parseVttTranscript(text) || parseJson3Transcript(text);
+        if (transcript) return transcript;
+      } catch (_) {}
     }
     return null;
   }
@@ -634,7 +691,8 @@ td.status-err { color: #ef4444; font-size: 1rem; }
   }
 
   async function extractTranscript(videoId) {
-    // Step 1: title and language via YouTube Data API (no proxy needed)
+    const diag = [];
+
     let title = videoId;
     let primaryLang = null;
     try {
@@ -655,13 +713,65 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       }
     } catch (_) {}
 
-    // Step 2: Innertube get_transcript (YouTube's own transcript panel API)
     try {
-      const innertext = await tryInnertubeTranscript(videoId);
-      if (innertext) return { title, transcript: innertext };
-    } catch (_) {}
+      const inv = await tryInvidiousTranscript(videoId);
+      if (inv) return { title, transcript: inv };
+      diag.push('inv:vac\xEDo');
+    } catch (_) { diag.push('inv:err'); }
 
-    // Step 3: timedtext track list
+    try {
+      const inn = await tryInnertubeTranscript(videoId);
+      if (inn) return { title, transcript: inn };
+      diag.push('inn:vac\xEDo');
+    } catch (_) { diag.push('inn:err'); }
+
+    let signedUrl = null;
+    let visitorData = null;
+    for (const [label, pageUrl] of [
+      ['embed', 'https://www.youtube.com/embed/' + videoId],
+      ['watch', 'https://www.youtube.com/watch?v=' + videoId],
+    ]) {
+      try {
+        const html = await fetchWithProxy(pageUrl);
+        if (html && html.length > 5000) {
+          const vdm = /"VISITOR_DATA":"([^"]+)"/.exec(html);
+          if (vdm) visitorData = vdm[1];
+          const playerData = extractJsonBlock(html, 'ytInitialPlayerResponse');
+          if (playerData) {
+            title = playerData?.videoDetails?.title || title;
+            const tracks = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+            if (tracks?.length) {
+              const track = tracks.find(t => t.kind !== 'asr') || tracks[0];
+              if (track?.baseUrl) { signedUrl = track.baseUrl; diag.push(label + ':trks=' + tracks.length); }
+              else diag.push(label + ':sin-url');
+            } else diag.push(label + ':sin-trks');
+          } else diag.push(label + ':pd-miss(' + Math.round(html.length / 1024) + 'K)');
+        } else diag.push(label + ':html-vac\xEDo');
+      } catch (_) { diag.push(label + ':err'); }
+      if (signedUrl) break;
+    }
+
+    if (signedUrl) {
+      for (const url of [signedUrl, signedUrl.replace(/&fmt=[^&]*/, '') + '&fmt=json3']) {
+        try {
+          const text = await fetchWithProxy(url);
+          if (text) {
+            const transcript = parseTimedtextXml(text) || parseVttTranscript(text) || parseJson3Transcript(text);
+            if (transcript) return { title, transcript };
+          }
+        } catch (_) {}
+      }
+      diag.push('cap:err');
+    } else diag.push('cap:sin-url');
+
+    if (visitorData) {
+      try {
+        const inn2 = await tryInnertubeTranscript(videoId, visitorData);
+        if (inn2) return { title, transcript: inn2 };
+        diag.push('inn2:vac\xEDo');
+      } catch (_) { diag.push('inn2:err'); }
+    }
+
     let trackLang = primaryLang;
     let trackKind = '';
     const listUrl = 'https://www.youtube.com/api/timedtext?v=' + videoId + '&type=list';
@@ -678,8 +788,6 @@ td.status-err { color: #ef4444; font-size: 1rem; }
         }
       } catch (_) {}
     }
-
-    // Step 4: try unsigned timedtext for each candidate lang/kind
     const candidates = [];
     if (trackLang) {
       candidates.push({ lang: trackLang, kind: trackKind });
@@ -691,7 +799,6 @@ td.status-err { color: #ef4444; font-size: 1rem; }
         candidates.push({ lang, kind: 'asr' });
       }
     }
-
     let proxyBlocked = !listNetworkOk;
     for (const { lang, kind } of candidates) {
       if (proxyBlocked) break;
@@ -704,47 +811,9 @@ td.status-err { color: #ef4444; font-size: 1rem; }
         if (transcript) return { title, transcript };
       }
     }
+    diag.push(proxyBlocked ? 'tdt:bloqueado' : 'tdt:vac\xEDo');
 
-    // Step 5: embed page — lighter than full watch page, has signed captionTrack baseUrl
-    try {
-      const embedHtml = await fetchWithProxy('https://www.youtube.com/embed/' + videoId);
-      if (embedHtml) {
-        const playerData = extractJsonBlock(embedHtml, 'ytInitialPlayerResponse');
-        if (playerData) {
-          const embedTitle = playerData?.videoDetails?.title || title;
-          const embedTracks = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-          if (embedTracks?.length) {
-            const track = embedTracks.find(t => t.kind !== 'asr') || embedTracks[0];
-            if (track?.baseUrl) {
-              const xmlText = await fetchWithProxy(track.baseUrl);
-              const transcript = parseTimedtextXml(xmlText) || parseJson3Transcript(xmlText);
-              if (transcript) return { title: embedTitle, transcript };
-            }
-          }
-        }
-      }
-    } catch (_) {}
-
-    // Step 6: full watch page scrape (largest page, last resort)
-    try {
-      const pageUrl = 'https://www.youtube.com/watch?v=' + videoId;
-      const html = await fetchWithProxy(pageUrl);
-      const playerData = extractJsonBlock(html, 'ytInitialPlayerResponse');
-      if (playerData) {
-        const pageTracks = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-        if (pageTracks?.length) {
-          const pageTitle = playerData?.videoDetails?.title || title;
-          const track = pageTracks.find(t => t.kind !== 'asr') || pageTracks[0];
-          if (track?.baseUrl) {
-            const xmlText = await fetchWithProxy(track.baseUrl);
-            const transcript = parseTimedtextXml(xmlText) || parseJson3Transcript(xmlText);
-            if (transcript) return { title: pageTitle, transcript };
-          }
-        }
-      }
-    } catch (_) {}
-
-    throw new Error('No se ha encontrado transcripci\xF3n disponible');
+    throw new Error(diag.join(' | '));
   }
 
   function appendLog(message, type) {
