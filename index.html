@@ -266,6 +266,49 @@ td.status-err { color: #ef4444; font-size: 1rem; }
 }
 
 .no-videos-msg.visible { display: block; }
+
+.api-key-section {
+  margin-top: 12px;
+}
+
+.api-key-toggle {
+  background: none;
+  border: none;
+  color: #7c3aed;
+  font-size: 0.82rem;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.api-key-toggle:hover { color: #a78bfa; }
+
+.api-key-body {
+  display: none;
+  margin-top: 10px;
+  padding: 12px;
+  background: #111;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  font-size: 0.82rem;
+}
+
+.api-key-body.visible { display: block; }
+
+.api-key-body p {
+  color: #888;
+  margin-bottom: 8px;
+  line-height: 1.5;
+}
+
+.api-key-body a { color: #7c3aed; }
+
+.api-key-body input {
+  height: 38px;
+  font-size: 0.82rem;
+  font-family: 'Courier New', monospace;
+}
 </style>
 </head>
 <body>
@@ -287,6 +330,17 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       <input type="text" id="playlist-input" placeholder="https://www.youtube.com/playlist?list=...">
       <div class="validation-msg" id="playlist-validation">Por favor, introduce una URL de playlist válida.</div>
       <div class="no-videos-msg" id="no-videos-msg">No se encontraron videos en esta playlist.</div>
+      <div class="api-key-section">
+        <button class="api-key-toggle" id="api-key-toggle">&#9654; Usar API Key de YouTube (recomendado)</button>
+        <div class="api-key-body" id="api-key-body">
+          <p>
+            Sin API key los proxies CORS suelen fallar con playlists.<br>
+            Obtén una gratis en <a href="https://console.cloud.google.com/" target="_blank" rel="noopener">Google Cloud Console</a>:
+            crea un proyecto → habilita <em>YouTube Data API v3</em> → Credenciales → Crear clave de API.
+          </p>
+          <input type="text" id="api-key-input" placeholder="AIzaSy...">
+        </div>
+      </div>
     </div>
 
     <button class="btn-primary" id="start-btn">Iniciar extracción</button>
@@ -356,6 +410,13 @@ td.status-err { color: #ef4444; font-size: 1rem; }
 
   document.getElementById('start-btn').addEventListener('click', startExtraction);
   document.getElementById('download-btn').addEventListener('click', downloadZip);
+
+  document.getElementById('api-key-toggle').addEventListener('click', () => {
+    const body = document.getElementById('api-key-body');
+    const btn = document.getElementById('api-key-toggle');
+    const open = body.classList.toggle('visible');
+    btn.textContent = (open ? '▼' : '▶') + ' Usar API Key de YouTube (recomendado)';
+  });
 
   function hideValidation() {
     document.getElementById('videos-validation').classList.remove('visible');
@@ -480,6 +541,43 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     // Matches "token":"<long_token>" used in continuationCommand
     const m = html.match(/"token"\s*:\s*"([\w%\-+=/.]{20,})"/);
     return m ? m[1] : null;
+  }
+
+  async function fetchPlaylistVideoIdsViaApi(playlistId, apiKey, logFn) {
+    const ids = [];
+    let pageToken = '';
+    let page = 1;
+    do {
+      const url = 'https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails&playlistId='
+        + encodeURIComponent(playlistId)
+        + '&maxResults=50&key=' + encodeURIComponent(apiKey)
+        + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : '');
+      logFn('API: obteniendo página ' + page + '...', 'info');
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      let data;
+      try {
+        const res = await fetch(url, { signal: controller.signal });
+        clearTimeout(timer);
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error?.message || 'HTTP ' + res.status);
+        }
+        data = await res.json();
+      } catch (e) {
+        clearTimeout(timer);
+        throw new Error('Error en la API de YouTube: ' + e.message);
+      }
+      for (const item of data.items || []) {
+        const id = item.contentDetails?.videoId;
+        if (id) ids.push(id);
+      }
+      logFn('Página ' + page + ': ' + ids.length + ' vídeos acumulados.', 'info');
+      pageToken = data.nextPageToken || '';
+      page++;
+      if (pageToken) await sleep(DELAY_MS);
+    } while (pageToken);
+    return ids;
   }
 
   async function fetchPlaylistVideoIds(playlistId, logFn) {
@@ -660,11 +758,19 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       updateProgress(0, 0, 'Obteniendo lista de videos...');
       appendLog('Obteniendo videos de la playlist...', 'info');
 
+      const apiKey = (document.getElementById('api-key-input').value || '').trim();
       let ids;
       try {
-        ids = await fetchPlaylistVideoIds(plId, appendLog);
+        if (apiKey) {
+          ids = await fetchPlaylistVideoIdsViaApi(plId, apiKey, appendLog);
+        } else {
+          ids = await fetchPlaylistVideoIds(plId, appendLog);
+        }
       } catch (e) {
         appendLog('Error al obtener playlist: ' + e.message, 'err');
+        if (!apiKey) {
+          appendLog('Consejo: introduce una API Key de YouTube para evitar fallos de proxy.', 'info');
+        }
         isProcessing = false;
         document.getElementById('start-btn').disabled = false;
         return;
