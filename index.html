@@ -380,6 +380,8 @@ td.status-err { color: #ef4444; font-size: 1rem; }
 (function () {
   'use strict';
 
+  const DEFAULT_API_KEY = 'AIzaSyDko1t0t1vsoTlsV3apvsX6hCNvX9X0QpE';
+
   const GET_PROXIES = [
     'https://corsproxy.io/?url=',
     'https://api.allorigins.win/raw?url=',
@@ -758,7 +760,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       updateProgress(0, 0, 'Obteniendo lista de videos...');
       appendLog('Obteniendo videos de la playlist...', 'info');
 
-      const apiKey = (document.getElementById('api-key-input').value || '').trim();
+      const apiKey = (document.getElementById('api-key-input').value || '').trim() || DEFAULT_API_KEY;
       let ids;
       try {
         if (apiKey) {
@@ -768,8 +770,8 @@ td.status-err { color: #ef4444; font-size: 1rem; }
         }
       } catch (e) {
         appendLog('Error al obtener playlist: ' + e.message, 'err');
-        if (!apiKey) {
-          appendLog('Consejo: introduce una API Key de YouTube para evitar fallos de proxy.', 'info');
+        if (!apiKey || apiKey === DEFAULT_API_KEY) {
+          appendLog('Comprueba que la playlist es pública e inténtalo de nuevo.', 'info');
         }
         isProcessing = false;
         document.getElementById('start-btn').disabled = false;
