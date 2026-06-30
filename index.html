@@ -518,16 +518,90 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     return text.length > 20 ? text : null;
   }
 
-  function looksLikeTimedtextXml(str) {
-    return str && (str.includes('<transcript') || str.includes('<timedtext') || str.includes('<?xml'));
+  function looksLikeTranscript(str) {
+    return str && (
+      str.includes('<transcript') || str.includes('<timedtext') || str.includes('<?xml') ||
+      (str.includes('"events"') && str.includes('"segs"'))
+    );
   }
 
-  // Tries to fetch a YouTube timedtext URL, first directly then via each proxy.
-  // Returns { xml: string|null, networkOk: boolean }
-  // xml is non-null only when the response looks like valid XML.
-  // networkOk is true if at least one source responded (even with empty/no-transcript XML).
+  function parseJson3Transcript(text) {
+    try {
+      const data = typeof text === 'string' ? JSON.parse(text) : text;
+      const events = data?.events;
+      if (!events) return null;
+      const parts = events
+        .filter(e => e.segs)
+        .map(e => e.segs.map(s => s.utf8 || '').join('').replace(/\n/g, ' ').trim())
+        .filter(t => t.length > 0);
+      const result = parts.join(' ');
+      return result.length > 20 ? result : null;
+    } catch (_) { return null; }
+  }
+
+  function buildTranscriptParams(videoId) {
+    const idBytes = new TextEncoder().encode(videoId);
+    const buf = new Uint8Array(2 + idBytes.length);
+    buf[0] = 0x0a;
+    buf[1] = idBytes.length;
+    buf.set(idBytes, 2);
+    return btoa(String.fromCharCode(...buf));
+  }
+
+  function parseInnertubeTranscript(data) {
+    try {
+      let segs = null;
+      const actions = data?.actions;
+      if (actions) {
+        for (const action of actions) {
+          const panel = action?.updateEngagementPanelAction?.content
+            ?.transcriptRenderer?.content
+            ?.transcriptSearchPanelRenderer?.body
+            ?.transcriptSegmentListRenderer?.initialSegments;
+          if (panel?.length) { segs = panel; break; }
+        }
+      }
+      if (!segs?.length) return null;
+      const parts = [];
+      for (const seg of segs) {
+        const runs = seg?.transcriptSegmentRenderer?.snippet?.runs || [];
+        const text = runs.map(r => r.text || '').join('').replace(/\n/g, ' ').trim();
+        if (text) parts.push(text);
+      }
+      const result = parts.join(' ');
+      return result.length > 50 ? result : null;
+    } catch (_) { return null; }
+  }
+
+  async function tryInnertubeTranscript(videoId) {
+    const url = 'https://www.youtube.com/youtubei/v1/get_transcript?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
+    const body = JSON.stringify({
+      context: { client: { clientName: 'WEB', clientVersion: '2.20240101.00.00', hl: 'en', gl: 'US' } },
+      params: buildTranscriptParams(videoId),
+    });
+    const encoded = encodeURIComponent(url);
+    for (const proxy of POST_PROXIES) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      try {
+        const res = await fetch(proxy + encoded, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        if (res.ok) {
+          const data = await res.json();
+          const transcript = parseInnertubeTranscript(data);
+          if (transcript) return transcript;
+        }
+      } catch (_) { clearTimeout(timer); }
+    }
+    return null;
+  }
+
   async function fetchTimedtextRaw(url) {
-    // 1. Direct fetch - works when browser has a YouTube session or timedtext supports CORS
     try {
       const c = new AbortController();
       const t = setTimeout(() => c.abort(), 7000);
@@ -535,11 +609,10 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       clearTimeout(t);
       if (res.ok) {
         const xml = await res.text();
-        return { xml: looksLikeTimedtextXml(xml) ? xml : '', networkOk: true };
+        return { xml: looksLikeTranscript(xml) ? xml : '', networkOk: true };
       }
     } catch (_) {}
 
-    // 2. CORS proxies - validate each response looks like XML before accepting
     const encoded = encodeURIComponent(url);
     let anyProxyResponded = false;
     for (const proxy of GET_PROXIES) {
@@ -551,8 +624,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
         if (res.ok) {
           const xml = await res.text();
           anyProxyResponded = true;
-          if (looksLikeTimedtextXml(xml)) return { xml, networkOk: true };
-          // Proxy returned 200 but with a non-XML error page - try next proxy
+          if (looksLikeTranscript(xml)) return { xml, networkOk: true };
         }
       } catch (_) {
         clearTimeout(t);
@@ -583,7 +655,13 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       }
     } catch (_) {}
 
-    // Step 2: timedtext track list - tiny XML that tells us which lang/kind is available
+    // Step 2: Innertube get_transcript (YouTube's own transcript panel API)
+    try {
+      const innertext = await tryInnertubeTranscript(videoId);
+      if (innertext) return { title, transcript: innertext };
+    } catch (_) {}
+
+    // Step 3: timedtext track list
     let trackLang = primaryLang;
     let trackKind = '';
     const listUrl = 'https://www.youtube.com/api/timedtext?v=' + videoId + '&type=list';
@@ -601,7 +679,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       } catch (_) {}
     }
 
-    // Step 3: try fetching transcript XML for each candidate lang/kind
+    // Step 4: try unsigned timedtext for each candidate lang/kind
     const candidates = [];
     if (trackLang) {
       candidates.push({ lang: trackLang, kind: trackKind });
@@ -614,9 +692,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       }
     }
 
-    // Skip the loop immediately if the track-list fetch already proved proxies are blocked.
     let proxyBlocked = !listNetworkOk;
-
     for (const { lang, kind } of candidates) {
       if (proxyBlocked) break;
       const tUrl = 'https://www.youtube.com/api/timedtext?v=' + videoId
@@ -624,24 +700,44 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       const { xml, networkOk } = await fetchTimedtextRaw(tUrl);
       if (!networkOk) { proxyBlocked = true; break; }
       if (xml) {
-        const transcript = parseTimedtextXml(xml);
+        const transcript = parseTimedtextXml(xml) || parseJson3Transcript(xml);
         if (transcript) return { title, transcript };
       }
     }
 
-    // Step 4: last resort - scrape the full video page to get the baseUrl for captions
+    // Step 5: embed page — lighter than full watch page, has signed captionTrack baseUrl
+    try {
+      const embedHtml = await fetchWithProxy('https://www.youtube.com/embed/' + videoId);
+      if (embedHtml) {
+        const playerData = extractJsonBlock(embedHtml, 'ytInitialPlayerResponse');
+        if (playerData) {
+          const embedTitle = playerData?.videoDetails?.title || title;
+          const embedTracks = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+          if (embedTracks?.length) {
+            const track = embedTracks.find(t => t.kind !== 'asr') || embedTracks[0];
+            if (track?.baseUrl) {
+              const xmlText = await fetchWithProxy(track.baseUrl);
+              const transcript = parseTimedtextXml(xmlText) || parseJson3Transcript(xmlText);
+              if (transcript) return { title: embedTitle, transcript };
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    // Step 6: full watch page scrape (largest page, last resort)
     try {
       const pageUrl = 'https://www.youtube.com/watch?v=' + videoId;
       const html = await fetchWithProxy(pageUrl);
       const playerData = extractJsonBlock(html, 'ytInitialPlayerResponse');
       if (playerData) {
         const pageTracks = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-        if (pageTracks && pageTracks.length > 0) {
+        if (pageTracks?.length) {
           const pageTitle = playerData?.videoDetails?.title || title;
           const track = pageTracks.find(t => t.kind !== 'asr') || pageTracks[0];
-          if (track.baseUrl) {
+          if (track?.baseUrl) {
             const xmlText = await fetchWithProxy(track.baseUrl);
-            const transcript = parseTimedtextXml(xmlText);
+            const transcript = parseTimedtextXml(xmlText) || parseJson3Transcript(xmlText);
             if (transcript) return { title: pageTitle, transcript };
           }
         }
