@@ -382,17 +382,41 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     return null;
   }
 
-  async function fetchWithProxy(targetUrl) {
+  async function fetchWithProxy(targetUrl, { method = 'GET', body = null, asJson = false } = {}) {
     const encoded = encodeURIComponent(targetUrl);
-    try {
-      const res = await fetch(PROXY_PRIMARY + encoded);
-      if (res.ok) return await res.text();
-    } catch (_) {}
-    try {
-      const res = await fetch(PROXY_FALLBACK + encoded);
-      if (res.ok) return await res.text();
-    } catch (_) {}
-    throw new Error('Ambos proxies fallaron para: ' + targetUrl);
+    const baseOpts = method === 'POST'
+      ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }
+      : {};
+
+    // allorigins does not support POST, so only try primary for POST
+    const proxies = method === 'POST' ? [PROXY_PRIMARY] : [PROXY_PRIMARY, PROXY_FALLBACK];
+
+    for (const proxy of proxies) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20000);
+      try {
+        const res = await fetch(proxy + encoded, { ...baseOpts, signal: controller.signal });
+        clearTimeout(timer);
+        if (res.ok) return asJson ? await res.json() : await res.text();
+      } catch (_) {
+        clearTimeout(timer);
+      }
+    }
+
+    // For GET, also try fallback if primary failed
+    if (method === 'GET') {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20000);
+      try {
+        const res = await fetch(PROXY_FALLBACK + encoded, { signal: controller.signal });
+        clearTimeout(timer);
+        if (res.ok) return asJson ? await res.json() : await res.text();
+      } catch (_) {
+        clearTimeout(timer);
+      }
+    }
+
+    throw new Error('Ambos proxies fallaron');
   }
 
   function sleep(ms) {
@@ -451,92 +475,76 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     }
   }
 
-  function collectVideoIds(obj, ids) {
-    if (!obj || typeof obj !== 'object') return;
-    if (Array.isArray(obj)) {
-      for (const item of obj) collectVideoIds(item, ids);
-      return;
-    }
-    if (obj.videoId && typeof obj.videoId === 'string') {
-      ids.add(obj.videoId);
-    }
-    for (const key of Object.keys(obj)) {
-      if (key !== 'videoId') collectVideoIds(obj[key], ids);
-    }
+  // Extract all 11-char YouTube video IDs from raw HTML via regex — fast, no JSON parsing
+  function extractVideoIdsFromHtml(html) {
+    const ids = new Set();
+    const re = /"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"/g;
+    let m;
+    while ((m = re.exec(html)) !== null) ids.add(m[1]);
+    return ids;
   }
 
-  async function fetchPlaylistVideoIds(playlistId) {
+  // Extract continuation token from raw HTML via regex
+  function extractContinuationTokenFromHtml(html) {
+    // Matches "token":"<long_token>" used in continuationCommand
+    const m = html.match(/"token"\s*:\s*"([\w%\-+=/.]{20,})"/);
+    return m ? m[1] : null;
+  }
+
+  async function fetchPlaylistVideoIds(playlistId, logFn) {
     const ids = new Set();
     const url = 'https://www.youtube.com/playlist?list=' + playlistId;
-    const html = await fetchWithProxy(url);
-    const data = extractJsonBlock(html, 'ytInitialData');
-    if (!data) throw new Error('ytInitialData no encontrado en la playlist');
 
-    collectVideoIds(data, ids);
+    logFn('Descargando página de playlist...', 'info');
+    let html;
+    try {
+      html = await fetchWithProxy(url);
+    } catch (e) {
+      throw new Error('No se pudo descargar la playlist: ' + e.message);
+    }
 
-    let continuation = findContinuationToken(data);
-    while (continuation) {
+    // Check for bot-detection / sign-in wall
+    if (html.includes('accounts.google.com') || html.includes('"isPrivate":true')) {
+      throw new Error('La playlist es privada o YouTube requiere inicio de sesión.');
+    }
+
+    const pageIds = extractVideoIdsFromHtml(html);
+    if (pageIds.size === 0) {
+      throw new Error('No se encontraron vídeos. Comprueba que la playlist es pública.');
+    }
+    for (const id of pageIds) ids.add(id);
+    logFn('Página 1: ' + ids.size + ' vídeos encontrados.', 'info');
+
+    // Continuation via youtubei API (POST through proxy)
+    let token = extractContinuationTokenFromHtml(html);
+    let page = 2;
+    while (token) {
       await sleep(DELAY_MS);
-      const contData = await fetchContinuation(continuation);
-      if (!contData) break;
-      collectVideoIds(contData, ids);
-      continuation = findContinuationToken(contData);
+      logFn('Obteniendo página ' + page + '...', 'info');
+      const apiUrl = 'https://www.youtube.com/youtubei/v1/browse';
+      const body = JSON.stringify({
+        continuation: token,
+        context: { client: { clientName: 'WEB', clientVersion: '2.20231121.00.00' } }
+      });
+      let contJson;
+      try {
+        contJson = await fetchWithProxy(apiUrl, { method: 'POST', body, asJson: true });
+      } catch (_) {
+        logFn('No se pudo obtener más páginas, continuando con ' + ids.size + ' vídeos.', 'info');
+        break;
+      }
+      const contHtml = JSON.stringify(contJson);
+      const newIds = extractVideoIdsFromHtml(contHtml);
+      const before = ids.size;
+      for (const id of newIds) ids.add(id);
+      const added = ids.size - before;
+      if (added === 0) break; // no new videos, stop
+      logFn('Página ' + page + ': +' + added + ' vídeos (' + ids.size + ' total).', 'info');
+      token = extractContinuationTokenFromHtml(contHtml);
+      page++;
     }
 
     return Array.from(ids);
-  }
-
-  function findContinuationToken(obj) {
-    if (!obj || typeof obj !== 'object') return null;
-    if (Array.isArray(obj)) {
-      for (const item of obj) {
-        const r = findContinuationToken(item);
-        if (r) return r;
-      }
-      return null;
-    }
-    if (obj.continuationItemRenderer) {
-      const cr = obj.continuationItemRenderer;
-      try {
-        return cr.continuationEndpoint.continuationCommand.token
-          || cr.continuationEndpoint.continuationCommand.continuation
-          || null;
-      } catch (_) {}
-    }
-    for (const key of Object.keys(obj)) {
-      const r = findContinuationToken(obj[key]);
-      if (r) return r;
-    }
-    return null;
-  }
-
-  async function fetchContinuation(token) {
-    const apiUrl = 'https://www.youtube.com/youtubei/v1/browse?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
-    const body = JSON.stringify({
-      continuation: token,
-      context: {
-        client: { clientName: 'WEB', clientVersion: '2.20231121.00.00' }
-      }
-    });
-    try {
-      const encoded = encodeURIComponent(apiUrl);
-      const res = await fetch(PROXY_PRIMARY + encoded, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body
-      });
-      if (res.ok) return await res.json();
-    } catch (_) {}
-    try {
-      const encoded = encodeURIComponent(apiUrl);
-      const res = await fetch(PROXY_FALLBACK + encoded, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body
-      });
-      if (res.ok) return await res.json();
-    } catch (_) {}
-    return null;
   }
 
   async function extractTranscript(videoId) {
@@ -637,7 +645,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
 
       let ids;
       try {
-        ids = await fetchPlaylistVideoIds(plId);
+        ids = await fetchPlaylistVideoIds(plId, appendLog);
       } catch (e) {
         appendLog('Error al obtener playlist: ' + e.message, 'err');
         isProcessing = false;
