@@ -266,49 +266,6 @@ td.status-err { color: #ef4444; font-size: 1rem; }
 }
 
 .no-videos-msg.visible { display: block; }
-
-.api-key-section {
-  margin-top: 12px;
-}
-
-.api-key-toggle {
-  background: none;
-  border: none;
-  color: #7c3aed;
-  font-size: 0.82rem;
-  cursor: pointer;
-  padding: 0;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-
-.api-key-toggle:hover { color: #a78bfa; }
-
-.api-key-body {
-  display: none;
-  margin-top: 10px;
-  padding: 12px;
-  background: #111;
-  border: 1px solid #2a2a2a;
-  border-radius: 8px;
-  font-size: 0.82rem;
-}
-
-.api-key-body.visible { display: block; }
-
-.api-key-body p {
-  color: #888;
-  margin-bottom: 8px;
-  line-height: 1.5;
-}
-
-.api-key-body a { color: #7c3aed; }
-
-.api-key-body input {
-  height: 38px;
-  font-size: 0.82rem;
-  font-family: 'Courier New', monospace;
-}
 </style>
 </head>
 <body>
@@ -330,17 +287,6 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       <input type="text" id="playlist-input" placeholder="https://www.youtube.com/playlist?list=...">
       <div class="validation-msg" id="playlist-validation">Por favor, introduce una URL de playlist válida.</div>
       <div class="no-videos-msg" id="no-videos-msg">No se encontraron videos en esta playlist.</div>
-      <div class="api-key-section">
-        <button class="api-key-toggle" id="api-key-toggle">&#9654; Usar API Key de YouTube (recomendado)</button>
-        <div class="api-key-body" id="api-key-body">
-          <p>
-            Sin API key los proxies CORS suelen fallar con playlists.<br>
-            Obtén una gratis en <a href="https://console.cloud.google.com/" target="_blank" rel="noopener">Google Cloud Console</a>:
-            crea un proyecto &rarr; habilita <em>YouTube Data API v3</em> &rarr; Credenciales &rarr; Crear clave de API.
-          </p>
-          <input type="text" id="api-key-input" placeholder="AIzaSy...">
-        </div>
-      </div>
     </div>
 
     <button class="btn-primary" id="start-btn">Iniciar extracción</button>
@@ -380,6 +326,8 @@ td.status-err { color: #ef4444; font-size: 1rem; }
 (function () {
   'use strict';
 
+  const DEFAULT_API_KEY = 'AIzaSyDko1t0t1vsoTlsV3apvsX6hCNvX9X0QpE';
+
   const GET_PROXIES = [
     'https://corsproxy.io/?url=',
     'https://api.allorigins.win/raw?url=',
@@ -410,13 +358,6 @@ td.status-err { color: #ef4444; font-size: 1rem; }
 
   document.getElementById('start-btn').addEventListener('click', startExtraction);
   document.getElementById('download-btn').addEventListener('click', downloadZip);
-
-  document.getElementById('api-key-toggle').addEventListener('click', () => {
-    const body = document.getElementById('api-key-body');
-    const btn = document.getElementById('api-key-toggle');
-    const open = body.classList.toggle('visible');
-    btn.textContent = (open ? '▼' : '►') + ' Usar API Key de YouTube (recomendado)';
-  });
 
   function hideValidation() {
     document.getElementById('videos-validation').classList.remove('visible');
@@ -549,7 +490,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
         + encodeURIComponent(playlistId)
         + '&maxResults=50&key=' + encodeURIComponent(apiKey)
         + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : '');
-      logFn('API: obteniendo p\xE1gina ' + page + '...', 'info');
+      logFn('Obteniendo p\xE1gina ' + page + '...', 'info');
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15000);
       let data;
@@ -569,91 +510,12 @@ td.status-err { color: #ef4444; font-size: 1rem; }
         const id = item.contentDetails?.videoId;
         if (id) ids.push(id);
       }
-      logFn('P\xE1gina ' + page + ': ' + ids.length + ' v\xEDdeos acumulados.', 'info');
+      logFn('P\xE1gina ' + page + ': ' + ids.length + ' v\xEDdeos encontrados.', 'info');
       pageToken = data.nextPageToken || '';
       page++;
       if (pageToken) await sleep(DELAY_MS);
     } while (pageToken);
     return ids;
-  }
-
-  async function fetchPlaylistVideoIds(playlistId, logFn) {
-    const ids = new Set();
-
-    logFn('Probando feed RSS de la playlist...', 'info');
-    try {
-      const rssUrl = 'https://www.youtube.com/feeds/videos.xml?playlist_id=' + playlistId;
-      const rssXml = await fetchWithProxy(rssUrl);
-      const rssMatches = [...rssXml.matchAll(/<yt:videoId>([a-zA-Z0-9_-]{11})<\/yt:videoId>/g)];
-      for (const m of rssMatches) ids.add(m[1]);
-      if (ids.size > 0) logFn('RSS: ' + ids.size + ' v\xEDdeos encontrados.', 'info');
-    } catch (_) {
-      logFn('Feed RSS no disponible, intentando p\xE1gina web...', 'info');
-    }
-
-    const url = 'https://www.youtube.com/playlist?list=' + playlistId;
-    logFn('Descargando p\xE1gina de playlist...', 'info');
-    let html;
-    try {
-      html = await fetchWithProxy(url);
-    } catch (e) {
-      if (ids.size > 0) {
-        logFn('P\xE1gina no accesible via proxy. Usando los ' + ids.size + ' v\xEDdeos del RSS (pueden ser solo los m\xE1s recientes).', 'warn');
-        return Array.from(ids);
-      }
-      throw new Error('No se pudo descargar la playlist: ' + e.message);
-    }
-
-    if (html.includes('accounts.google.com') || html.includes('"isPrivate":true')) {
-      if (ids.size > 0) {
-        logFn('La playlist requiere login. Usando ' + ids.size + ' v\xEDdeos del RSS.', 'warn');
-        return Array.from(ids);
-      }
-      throw new Error('La playlist es privada o YouTube requiere inicio de sesi\xF3n.');
-    }
-
-    const pageIds = extractVideoIdsFromHtml(html);
-    if (pageIds.size === 0) {
-      if (ids.size > 0) {
-        logFn('P\xE1gina sin v\xEDdeos detectables. Usando ' + ids.size + ' v\xEDdeos del RSS.', 'warn');
-        return Array.from(ids);
-      }
-      throw new Error('No se encontraron v\xEDdeos. Comprueba que la playlist es p\xFAblica.');
-    }
-
-    const beforePage = ids.size;
-    for (const id of pageIds) ids.add(id);
-    logFn('P\xE1gina 1: ' + ids.size + ' v\xEDdeos encontrados (' + (ids.size - beforePage) + ' nuevos).', 'info');
-
-    let token = extractContinuationTokenFromHtml(html);
-    let page = 2;
-    while (token) {
-      await sleep(DELAY_MS);
-      logFn('Obteniendo p\xE1gina ' + page + '...', 'info');
-      const apiUrl = 'https://www.youtube.com/youtubei/v1/browse';
-      const body = JSON.stringify({
-        continuation: token,
-        context: { client: { clientName: 'WEB', clientVersion: '2.20231121.00.00' } }
-      });
-      let contJson;
-      try {
-        contJson = await fetchWithProxy(apiUrl, { method: 'POST', body, asJson: true });
-      } catch (_) {
-        logFn('No se pudo obtener m\xE1s p\xE1ginas, continuando con ' + ids.size + ' v\xEDdeos.', 'info');
-        break;
-      }
-      const contHtml = JSON.stringify(contJson);
-      const newIds = extractVideoIdsFromHtml(contHtml);
-      const before = ids.size;
-      for (const id of newIds) ids.add(id);
-      const added = ids.size - before;
-      if (added === 0) break;
-      logFn('P\xE1gina ' + page + ': +' + added + ' v\xEDdeos (' + ids.size + ' total).', 'info');
-      token = extractContinuationTokenFromHtml(contHtml);
-      page++;
-    }
-
-    return Array.from(ids);
   }
 
   async function extractTranscript(videoId) {
@@ -750,21 +612,14 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       document.getElementById('results-section').classList.remove('visible');
       document.getElementById('log-box').innerHTML = '';
       updateProgress(0, 0, 'Obteniendo lista de videos...');
-      appendLog('Obteniendo videos de la playlist...', 'info');
+      appendLog('Obteniendo v\xEDdeos de la playlist...', 'info');
 
-      const apiKey = (document.getElementById('api-key-input').value || '').trim();
       let ids;
       try {
-        if (apiKey) {
-          ids = await fetchPlaylistVideoIdsViaApi(plId, apiKey, appendLog);
-        } else {
-          ids = await fetchPlaylistVideoIds(plId, appendLog);
-        }
+        ids = await fetchPlaylistVideoIdsViaApi(plId, DEFAULT_API_KEY, appendLog);
       } catch (e) {
         appendLog('Error al obtener playlist: ' + e.message, 'err');
-        if (!apiKey) {
-          appendLog('Consejo: introduce una API Key de YouTube para evitar fallos de proxy.', 'info');
-        }
+        appendLog('Comprueba que la playlist es p\xFAblica e int\xE9ntalo de nuevo.', 'info');
         isProcessing = false;
         document.getElementById('start-btn').disabled = false;
         return;
