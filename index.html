@@ -326,8 +326,15 @@ td.status-err { color: #ef4444; font-size: 1rem; }
 (function () {
   'use strict';
 
-  const PROXY_PRIMARY = 'https://corsproxy.io/?url=';
-  const PROXY_FALLBACK = 'https://api.allorigins.win/raw?url=';
+  const GET_PROXIES = [
+    'https://corsproxy.io/?url=',
+    'https://api.allorigins.win/raw?url=',
+    'https://api.codetabs.com/v1/proxy?quest=',
+    'https://thingproxy.freeboard.io/fetch/',
+  ];
+  const POST_PROXIES = [
+    'https://corsproxy.io/?url=',
+  ];
   const DELAY_MS = 500;
   const ERROR_TEXT = 'No se ha podido extraer la transcripción de este video.';
 
@@ -384,12 +391,10 @@ td.status-err { color: #ef4444; font-size: 1rem; }
 
   async function fetchWithProxy(targetUrl, { method = 'GET', body = null, asJson = false } = {}) {
     const encoded = encodeURIComponent(targetUrl);
+    const proxies = method === 'POST' ? POST_PROXIES : GET_PROXIES;
     const baseOpts = method === 'POST'
       ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }
       : {};
-
-    // allorigins does not support POST, so only try primary for POST
-    const proxies = method === 'POST' ? [PROXY_PRIMARY] : [PROXY_PRIMARY, PROXY_FALLBACK];
 
     for (const proxy of proxies) {
       const controller = new AbortController();
@@ -402,21 +407,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
         clearTimeout(timer);
       }
     }
-
-    // For GET, also try fallback if primary failed
-    if (method === 'GET') {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 20000);
-      try {
-        const res = await fetch(PROXY_FALLBACK + encoded, { signal: controller.signal });
-        clearTimeout(timer);
-        if (res.ok) return asJson ? await res.json() : await res.text();
-      } catch (_) {
-        clearTimeout(timer);
-      }
-    }
-
-    throw new Error('Ambos proxies fallaron');
+    throw new Error('Todos los proxies fallaron');
   }
 
   function sleep(ms) {
@@ -493,27 +484,53 @@ td.status-err { color: #ef4444; font-size: 1rem; }
 
   async function fetchPlaylistVideoIds(playlistId, logFn) {
     const ids = new Set();
-    const url = 'https://www.youtube.com/playlist?list=' + playlistId;
 
+    // Strategy 1: RSS feed — lightweight, reliable, returns ~15 most recent videos
+    logFn('Probando feed RSS de la playlist...', 'info');
+    try {
+      const rssUrl = 'https://www.youtube.com/feeds/videos.xml?playlist_id=' + playlistId;
+      const rssXml = await fetchWithProxy(rssUrl);
+      const rssMatches = [...rssXml.matchAll(/<yt:videoId>([a-zA-Z0-9_-]{11})<\/yt:videoId>/g)];
+      for (const m of rssMatches) ids.add(m[1]);
+      if (ids.size > 0) logFn('RSS: ' + ids.size + ' vídeos encontrados.', 'info');
+    } catch (_) {
+      logFn('Feed RSS no disponible, intentando página web...', 'info');
+    }
+
+    // Strategy 2: Full playlist HTML page (100+ videos, needs proxy)
+    const url = 'https://www.youtube.com/playlist?list=' + playlistId;
     logFn('Descargando página de playlist...', 'info');
     let html;
     try {
       html = await fetchWithProxy(url);
     } catch (e) {
+      if (ids.size > 0) {
+        logFn('Página no accesible via proxy. Usando los ' + ids.size + ' vídeos del RSS (pueden ser solo los más recientes).', 'warn');
+        return Array.from(ids);
+      }
       throw new Error('No se pudo descargar la playlist: ' + e.message);
     }
 
-    // Check for bot-detection / sign-in wall
     if (html.includes('accounts.google.com') || html.includes('"isPrivate":true')) {
+      if (ids.size > 0) {
+        logFn('La playlist requiere login. Usando ' + ids.size + ' vídeos del RSS.', 'warn');
+        return Array.from(ids);
+      }
       throw new Error('La playlist es privada o YouTube requiere inicio de sesión.');
     }
 
     const pageIds = extractVideoIdsFromHtml(html);
     if (pageIds.size === 0) {
+      if (ids.size > 0) {
+        logFn('Página sin vídeos detectables. Usando ' + ids.size + ' vídeos del RSS.', 'warn');
+        return Array.from(ids);
+      }
       throw new Error('No se encontraron vídeos. Comprueba que la playlist es pública.');
     }
+
+    const beforePage = ids.size;
     for (const id of pageIds) ids.add(id);
-    logFn('Página 1: ' + ids.size + ' vídeos encontrados.', 'info');
+    logFn('Página 1: ' + ids.size + ' vídeos encontrados (' + (ids.size - beforePage) + ' nuevos).', 'info');
 
     // Continuation via youtubei API (POST through proxy)
     let token = extractContinuationTokenFromHtml(html);
@@ -538,7 +555,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       const before = ids.size;
       for (const id of newIds) ids.add(id);
       const added = ids.size - before;
-      if (added === 0) break; // no new videos, stop
+      if (added === 0) break;
       logFn('Página ' + page + ': +' + added + ' vídeos (' + ids.size + ' total).', 'info');
       token = extractContinuationTokenFromHtml(contHtml);
       page++;
