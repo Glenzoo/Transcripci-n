@@ -518,35 +518,100 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     return ids;
   }
 
-  async function extractTranscript(videoId) {
-    const pageUrl = 'https://www.youtube.com/watch?v=' + videoId;
-    const html = await fetchWithProxy(pageUrl);
-
-    const playerData = extractJsonBlock(html, 'ytInitialPlayerResponse');
-    if (!playerData) throw new Error('ytInitialPlayerResponse no encontrado');
-
-    const tracks =
-      playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-    if (!tracks || tracks.length === 0) throw new Error('Sin pistas de subt\xEDtulos');
-
-    const title = playerData?.videoDetails?.title || videoId;
-
-    let track = tracks.find(t => t.kind !== 'asr') || tracks[0];
-    const trackUrl = track.baseUrl;
-    if (!trackUrl) throw new Error('baseUrl no disponible en la pista');
-
-    const xmlText = await fetchWithProxy(trackUrl);
+  function parseTimedtextXml(xmlText) {
+    if (!xmlText || !xmlText.includes('<text')) return null;
     const parser = new DOMParser();
     const doc = parser.parseFromString(xmlText, 'application/xml');
-    const textNodes = doc.querySelectorAll('text');
-    if (textNodes.length === 0) throw new Error('No se encontraron elementos <text> en el XML');
-
-    const transcript = Array.from(textNodes)
+    const nodes = doc.querySelectorAll('text');
+    if (nodes.length === 0) return null;
+    const text = Array.from(nodes)
       .map(n => decodeHtmlEntities(n.textContent || '').replace(/\n/g, ' ').trim())
       .filter(t => t.length > 0)
       .join(' ');
+    return text.length > 20 ? text : null;
+  }
 
-    return { title, transcript };
+  async function fetchTimedtext(videoId, lang, kind) {
+    let url = 'https://www.youtube.com/api/timedtext?v=' + videoId + '&lang=' + lang;
+    if (kind) url += '&kind=' + kind;
+    const xml = await fetchWithProxy(url);
+    return parseTimedtextXml(xml);
+  }
+
+  async function extractTranscript(videoId) {
+    // Step 1: get title via API (no proxy needed)
+    let title = videoId;
+    let primaryLang = null;
+    try {
+      const apiUrl = 'https://www.googleapis.com/youtube/v3/videos?part=snippet&id='
+        + encodeURIComponent(videoId) + '&key=' + encodeURIComponent(DEFAULT_API_KEY);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10000);
+      const res = await fetch(apiUrl, { signal: controller.signal });
+      clearTimeout(timer);
+      if (res.ok) {
+        const data = await res.json();
+        const item = data.items?.[0];
+        if (item) {
+          title = item.snippet?.title || videoId;
+          const lang = item.snippet?.defaultAudioLanguage || item.snippet?.defaultLanguage || '';
+          if (lang) primaryLang = lang.split('-')[0];
+        }
+      }
+    } catch (_) {}
+
+    // Step 2: get available tracks list (tiny XML, far easier for proxies than full page)
+    let trackLang = primaryLang;
+    let trackKind = '';
+    try {
+      const listUrl = 'https://www.youtube.com/api/timedtext?v=' + videoId + '&type=list';
+      const listXml = await fetchWithProxy(listUrl);
+      if (listXml && listXml.includes('<track')) {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(listXml, 'application/xml');
+        const tracks = Array.from(doc.querySelectorAll('track'));
+        const best = tracks.find(t => t.getAttribute('lang_default') === 'true') || tracks[0];
+        if (best) {
+          trackLang = best.getAttribute('lang_code') || trackLang;
+          trackKind = best.getAttribute('kind') || '';
+        }
+      }
+    } catch (_) {}
+
+    // Step 3: fetch transcript from timedtext endpoint (small files, proxy-friendly)
+    const candidates = [];
+    if (trackLang) {
+      candidates.push({ lang: trackLang, kind: trackKind });
+      candidates.push({ lang: trackLang, kind: 'asr' });
+    }
+    for (const lang of ['es', 'en', 'pt', 'fr', 'de', 'it', 'ca', 'gl']) {
+      if (lang !== trackLang) {
+        candidates.push({ lang, kind: '' });
+        candidates.push({ lang, kind: 'asr' });
+      }
+    }
+
+    for (const { lang, kind } of candidates) {
+      try {
+        const transcript = await fetchTimedtext(videoId, lang, kind);
+        if (transcript) return { title, transcript };
+      } catch (_) {}
+    }
+
+    // Step 4: last resort — full page scrape
+    const pageUrl = 'https://www.youtube.com/watch?v=' + videoId;
+    const html = await fetchWithProxy(pageUrl);
+    const playerData = extractJsonBlock(html, 'ytInitialPlayerResponse');
+    if (!playerData) throw new Error('No se encontr\xF3 transcripci\xF3n');
+    const tracks = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+    if (!tracks || tracks.length === 0) throw new Error('Sin pistas de subt\xEDtulos');
+    const pageTitle = playerData?.videoDetails?.title || title;
+    const track = tracks.find(t => t.kind !== 'asr') || tracks[0];
+    if (!track.baseUrl) throw new Error('baseUrl no disponible');
+    const xmlText = await fetchWithProxy(track.baseUrl);
+    const transcript = parseTimedtextXml(xmlText);
+    if (!transcript) throw new Error('Transcripci\xF3n vac\xEDa');
+    return { title: pageTitle, transcript };
   }
 
   function appendLog(message, type) {
