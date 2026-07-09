@@ -412,6 +412,33 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     throw new Error('Todos los proxies fallaron');
   }
 
+  // Fetches a YouTube page via ALL GET proxies in parallel and returns the
+  // best response — preferring one that contains captionTracks, then
+  // ytInitialPlayerResponse, then the longest body.
+  async function fetchBestProxy(targetUrl) {
+    const encoded = encodeURIComponent(targetUrl);
+    const results = await Promise.allSettled(GET_PROXIES.map(async proxy => {
+      const c = new AbortController();
+      const t = setTimeout(() => c.abort(), 15000);
+      try {
+        const res = await fetch(proxy + encoded, { signal: c.signal });
+        clearTimeout(t);
+        if (!res.ok) return null;
+        return await res.text();
+      } catch (_) {
+        clearTimeout(t);
+        return null;
+      }
+    }));
+    const texts = results
+      .filter(r => r.status === 'fulfilled' && r.value && r.value.length > 5000)
+      .map(r => r.value);
+    if (!texts.length) return null;
+    return texts.find(t => t.includes('"captionTracks"'))
+      || texts.find(t => t.includes('ytInitialPlayerResponse'))
+      || texts.reduce((a, b) => a.length > b.length ? a : b);
+  }
+
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -642,6 +669,8 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     const BASE_URL = 'https://www.youtube.com/youtubei/v1/player'
       + '?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false';
     const clientConfigs = [
+      { clientName: 'WEB_CREATOR', clientVersion: '1.20220912.01.00', hl: 'en', gl: 'US' },
+      { clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0', hl: 'en', gl: 'US' },
       { clientName: 'IOS', clientVersion: '19.09.3', deviceModel: 'iPhone14,3', osName: 'iPhone', osVersion: '16.0', hl: 'en', gl: 'US' },
       { clientName: 'TVHTML5', clientVersion: '7.20220325', hl: 'en', gl: 'US' },
       { clientName: 'ANDROID', clientVersion: '17.31.35', androidSdkVersion: 30, hl: 'en', gl: 'US', utcOffsetMinutes: 0 },
@@ -803,15 +832,23 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     // Step 5: Scrape YouTube page for signed caption URLs
     let signedUrl = null;
     let visitorData = null;
+    const CONSENT_PHRASES = [
+      'consent.youtube', 'Before you continue', 'Antes de continuar',
+      'Avant de continuer', 'Bevor du weitermachst', 'Prima di continuare',
+      'Antes de que sigas', 'cookie-consent', 'cookieconsent',
+    ];
     for (const [label, pageUrl] of [
       ['nocookie', 'https://www.youtube-nocookie.com/embed/' + videoId],
       ['embed', 'https://www.youtube.com/embed/' + videoId],
-      ['watch', 'https://www.youtube.com/watch?v=' + videoId + '&bpctr=9999999999'],
+      ['watch', 'https://www.youtube.com/watch?v=' + videoId + '&bpctr=9999999999&hl=en&gl=US&has_verified=1'],
     ]) {
       try {
-        const html = await fetchWithProxy(pageUrl);
+        // For the watch page, try ALL proxies in parallel and pick the best response.
+        const html = label === 'watch'
+          ? await fetchBestProxy(pageUrl)
+          : await fetchWithProxy(pageUrl).catch(() => null);
         if (html && html.length > 5000) {
-          if (html.includes('consent.youtube') || html.includes('Before you continue')) {
+          if (CONSENT_PHRASES.some(p => html.includes(p))) {
             diag.push(label + ':consent'); continue;
           }
           const vdm = /"VISITOR_DATA":"([^"]+)"/.exec(html);
@@ -826,10 +863,17 @@ td.status-err { color: #ef4444; font-size: 1rem; }
               else diag.push(label + ':sin-url');
             } else diag.push(label + ':sin-trks');
           } else {
-            // JSON parse failed — try direct regex extraction of caption URL from raw HTML
             const captionUrl = extractCaptionUrlFromHtml(html);
             if (captionUrl) { signedUrl = captionUrl; diag.push(label + ':regex-url'); }
-            else diag.push(label + ':pd-miss(' + Math.round(html.length / 1024) + 'K)');
+            else {
+              const hasIpr = html.includes('ytInitialPlayerResponse');
+              const hasCt = html.includes('"captionTracks"');
+              if (typeof window !== 'undefined') {
+                window.__ytDebug = { label, url: pageUrl, length: html.length, excerpt: html.slice(0, 600) };
+              }
+              diag.push(label + ':pd-miss(' + Math.round(html.length / 1024) + 'K)['
+                + (hasIpr ? 'ipr' : 'no-ipr') + ',' + (hasCt ? 'ct' : 'no-ct') + ']');
+            }
           }
         } else diag.push(label + ':html-vac\xEDo');
       } catch (_) { diag.push(label + ':err'); }
