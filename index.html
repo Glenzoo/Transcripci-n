@@ -548,6 +548,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
   function looksLikeTranscript(str) {
     return str && (
       str.includes('<transcript') || str.includes('<timedtext') || str.includes('<?xml') ||
+      str.includes('WEBVTT') ||
       (str.includes('"events"') && str.includes('"segs"'))
     );
   }
@@ -585,34 +586,46 @@ td.status-err { color: #ef4444; font-size: 1rem; }
   function buildTranscriptParams(videoId, format) {
     const idBytes = new TextEncoder().encode(videoId);
     if (format === 'nested') {
+      // {1: {1: videoId}} — alternative protobuf encoding some YouTube versions use
       const inner = new Uint8Array(2 + idBytes.length);
       inner[0] = 0x0a; inner[1] = idBytes.length; inner.set(idBytes, 2);
       const outer = new Uint8Array(2 + inner.length);
       outer[0] = 0x0a; outer[1] = inner.length; outer.set(inner, 2);
       return btoa(String.fromCharCode(...outer));
     }
+    // {1: videoId} — simple encoding
     const buf = new Uint8Array(2 + idBytes.length);
     buf[0] = 0x0a; buf[1] = idBytes.length; buf.set(idBytes, 2);
     return btoa(String.fromCharCode(...buf));
   }
 
+  function findDeep(obj, key, maxDepth) {
+    if (maxDepth === undefined) maxDepth = 12;
+    if (!obj || typeof obj !== 'object' || maxDepth === 0) return undefined;
+    if (key in obj) return obj[key];
+    for (const v of Object.values(obj)) {
+      const r = findDeep(v, key, maxDepth - 1);
+      if (r !== undefined) return r;
+    }
+    return undefined;
+  }
+
   function parseInnertubeTranscript(data) {
     try {
       let segs = null;
-      const actions = data?.actions;
-      if (actions) {
-        for (const action of actions) {
-          const panel = action?.updateEngagementPanelAction?.content
-            ?.transcriptRenderer?.content
-            ?.transcriptSearchPanelRenderer?.body
-            ?.transcriptSegmentListRenderer?.initialSegments;
-          if (panel?.length) { segs = panel; break; }
-        }
+      for (const action of data?.actions ?? []) {
+        const panel = action?.updateEngagementPanelAction?.content
+          ?.transcriptRenderer?.content
+          ?.transcriptSearchPanelRenderer?.body
+          ?.transcriptSegmentListRenderer?.initialSegments;
+        if (panel?.length) { segs = panel; break; }
       }
+      if (!segs?.length) segs = findDeep(data, 'initialSegments');
       if (!segs?.length) return null;
       const parts = [];
       for (const seg of segs) {
-        const runs = seg?.transcriptSegmentRenderer?.snippet?.runs || [];
+        const runs = seg?.transcriptSegmentRenderer?.snippet?.runs
+          ?? findDeep(seg, 'runs') ?? [];
         const text = runs.map(r => r.text || '').join('').replace(/\n/g, ' ').trim();
         if (text) parts.push(text);
       }
@@ -622,27 +635,59 @@ td.status-err { color: #ef4444; font-size: 1rem; }
   }
 
   async function tryInnertubeTranscript(videoId, visitorData = null) {
-    const url = 'https://www.youtube.com/youtubei/v1/get_transcript';
+    const INN_URL = 'https://www.youtube.com/youtubei/v1/get_transcript';
     const client = { clientName: 'WEB', clientVersion: '2.9999099', hl: 'en', gl: 'US' };
     if (visitorData) client.visitorData = visitorData;
-    const encoded = encodeURIComponent(url);
+    const encoded = encodeURIComponent(INN_URL);
     for (const params of [buildTranscriptParams(videoId, 'nested'), buildTranscriptParams(videoId)]) {
       const body = JSON.stringify({ context: { client }, params });
+
+      // Direct browser fetch with user's YouTube session cookies (no proxy needed if CORS allows)
+      try {
+        const c = new AbortController();
+        const t = setTimeout(() => c.abort(), 8000);
+        const res = await fetch(INN_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body,
+          signal: c.signal,
+        });
+        clearTimeout(t);
+        if (res.ok) {
+          const data = await res.json().catch(() => null);
+          if (data) {
+            if (typeof window !== 'undefined') window.__ytInnDebug = data;
+            const transcript = parseInnertubeTranscript(data);
+            if (transcript) return transcript;
+          }
+        }
+      } catch (_) {}
+
+      // Proxy fallback
       for (const proxy of POST_PROXIES) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 15000);
         try {
           const res = await fetch(proxy + encoded, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Youtube-Client-Name': '1',
+              'X-Youtube-Client-Version': '2.9999099',
+              'Accept-Language': 'en-US,en;q=0.9',
+            },
             body,
             signal: controller.signal,
           });
           clearTimeout(timer);
           if (res.ok) {
-            const data = await res.json();
-            const transcript = parseInnertubeTranscript(data);
-            if (transcript) return transcript;
+            const data = await res.json().catch(() => null);
+            if (data) {
+              if (typeof window !== 'undefined') window.__ytInnDebug = data;
+              const transcript = parseInnertubeTranscript(data);
+              if (transcript) return transcript;
+            }
           }
         } catch (_) { clearTimeout(timer); }
       }
@@ -675,13 +720,52 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     ];
     for (const client of clientConfigs) {
       const body = JSON.stringify({ context: { client }, videoId, contentCheckOk: true, racyCheckOk: true });
+
+      // Direct browser fetch with user's YouTube session cookies
+      try {
+        const c = new AbortController();
+        const t = setTimeout(() => c.abort(), 8000);
+        const res = await fetch(BASE_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body,
+          signal: c.signal,
+        });
+        clearTimeout(t);
+        if (res.ok) {
+          const data = await res.json().catch(() => null);
+          const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+          if (tracks?.length) {
+            const track = tracks.find(t => t.languageCode?.startsWith('es') && t.kind !== 'asr')
+              || tracks.find(t => t.languageCode?.startsWith('es'))
+              || tracks.find(t => t.kind !== 'asr')
+              || tracks[0];
+            if (track?.baseUrl) {
+              for (const capUrl of [track.baseUrl + '&fmt=json3', track.baseUrl]) {
+                const text = await fetchWithProxy(capUrl).catch(() => null);
+                if (text) {
+                  const tr = parseJson3Transcript(text) || parseTimedtextXml(text) || parseVttTranscript(text);
+                  if (tr) return tr;
+                }
+              }
+            }
+          }
+        }
+      } catch (_) {}
+
       for (const proxy of POST_PROXIES) {
         try {
           const c = new AbortController();
           const t = setTimeout(() => c.abort(), 20000);
           const res = await fetch(proxy + encodeURIComponent(BASE_URL), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Youtube-Client-Name': '1',
+              'X-Youtube-Client-Version': client.clientVersion,
+              'Accept-Language': 'en-US,en;q=0.9',
+            },
             body,
             signal: c.signal,
           });
@@ -710,11 +794,15 @@ td.status-err { color: #ef4444; font-size: 1rem; }
 
   async function tryInvidiousTranscript(videoId) {
     const instances = [
+      'https://yewtu.be',
+      'https://inv.nadeko.net',
+      'https://invidious.fdn.fr',
+      'https://yt.cdaut.de',
       'https://invidious.privacydev.net',
       'https://iv.datura.network',
       'https://invidious.perennialte.ch',
-      'https://yt.cdaut.de',
-      'https://invidious.fdn.fr',
+      'https://invidious.slipfox.xyz',
+      'https://inv.tux.pizza',
     ];
     for (const base of instances) {
       try {
@@ -743,7 +831,54 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     return null;
   }
 
+  async function tryPipedTranscript(videoId) {
+    const instances = [
+      'https://pipedapi.kavin.rocks',
+      'https://api.piped.projectsegfau.lt',
+      'https://pipedapi.adminforge.de',
+      'https://piped-api.garudalinux.org',
+      'https://pipedapi.in.projectsegfau.lt',
+      'https://watchapi.whatever.social',
+    ];
+    for (const base of instances) {
+      try {
+        const c = new AbortController();
+        const t = setTimeout(() => c.abort(), 8000);
+        const res = await fetch(base + '/streams/' + videoId, { signal: c.signal });
+        clearTimeout(t);
+        if (!res.ok) continue;
+        const data = await res.json().catch(() => null);
+        if (!data) continue;
+        const subtitles = data.subtitles || [];
+        if (!subtitles.length) continue;
+        const sub = subtitles.find(s => s.code?.startsWith('es') && !s.autoGenerated)
+          || subtitles.find(s => s.code?.startsWith('es'))
+          || subtitles[0];
+        if (!sub?.url) continue;
+        const subUrl = sub.url.startsWith('/') ? base + sub.url : sub.url;
+        let text = null;
+        try {
+          const c2 = new AbortController();
+          const t2 = setTimeout(() => c2.abort(), 8000);
+          const cr = await fetch(subUrl, { signal: c2.signal });
+          clearTimeout(t2);
+          if (cr.ok) text = await cr.text();
+        } catch (_) {}
+        if (!text) text = await fetchWithProxy(subUrl).catch(() => null);
+        if (!text) continue;
+        const transcript = parseVttTranscript(text) || parseTimedtextXml(text) || parseJson3Transcript(text);
+        if (transcript) return transcript;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  // Tries to fetch a YouTube timedtext URL, first directly then via each proxy.
+  // Returns { xml: string|null, networkOk: boolean }
+  // xml is non-null only when the response looks like valid XML.
+  // networkOk is true if at least one source responded (even with empty/no-transcript XML).
   async function fetchTimedtextRaw(url) {
+    // 1. Direct fetch — works if the user has a YouTube session or CORS is allowed
     try {
       const c = new AbortController();
       const t = setTimeout(() => c.abort(), 7000);
@@ -755,6 +890,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       }
     } catch (_) {}
 
+    // 2. CORS proxies — validate each response looks like XML before accepting
     const encoded = encodeURIComponent(url);
     let anyProxyResponded = false;
     for (const proxy of GET_PROXIES) {
@@ -767,6 +903,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
           const xml = await res.text();
           anyProxyResponded = true;
           if (looksLikeTranscript(xml)) return { xml, networkOk: true };
+          // Proxy returned 200 but with a non-XML error page — try next proxy
         }
       } catch (_) {
         clearTimeout(t);
@@ -799,7 +936,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       }
     } catch (_) {}
 
-    // Step 2: Player endpoint (multiple clients, returns signed captionTracks)
+    // Step 2: Player endpoint (ANDROID client, returns signed captionTracks)
     try {
       const plr = await tryPlayerEndpoint(videoId);
       if (plr) return { title, transcript: plr };
@@ -812,6 +949,13 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       if (inv) return { title, transcript: inv };
       diag.push('inv:vac\xEDo');
     } catch (_) { diag.push('inv:err'); }
+
+    // Step 3.5: Piped API (alternative open-source YouTube frontend)
+    try {
+      const pip = await tryPipedTranscript(videoId);
+      if (pip) return { title, transcript: pip };
+      diag.push('pip:vac\xEDo');
+    } catch (_) { diag.push('pip:err'); }
 
     // Step 4: Innertube get_transcript (YouTube's own panel API)
     try {
@@ -829,14 +973,16 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       'Antes de que sigas', 'cookie-consent', 'cookieconsent',
     ];
     for (const [label, pageUrl] of [
+      ['mobile', 'https://m.youtube.com/watch?v=' + videoId],
       ['nocookie', 'https://www.youtube-nocookie.com/embed/' + videoId],
       ['embed', 'https://www.youtube.com/embed/' + videoId],
-      ['watch', 'https://www.youtube.com/watch?v=' + videoId + '&bpctr=9999999999&hl=en&gl=US&has_verified=1'],
+      ['watch', 'https://www.youtube.com/watch?v=' + videoId + '&bpctr=9999999999'],
     ]) {
       try {
-        // For the watch page, try ALL proxies in parallel and pick the best response.
+        // For the watch page, try ALL proxies in parallel and pick the best response;
+        // fall back to sequential fetchWithProxy if parallel returns nothing.
         const html = label === 'watch'
-          ? await fetchBestProxy(pageUrl)
+          ? ((await fetchBestProxy(pageUrl)) ?? await fetchWithProxy(pageUrl).catch(() => null))
           : await fetchWithProxy(pageUrl).catch(() => null);
         if (html && html.length > 5000) {
           if (CONSENT_PHRASES.some(p => html.includes(p))) {
@@ -925,14 +1071,17 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     let proxyBlocked = !listNetworkOk;
     for (const { lang, kind } of candidates) {
       if (proxyBlocked) break;
-      const tUrl = 'https://www.youtube.com/api/timedtext?v=' + videoId
+      const base = 'https://www.youtube.com/api/timedtext?v=' + videoId
         + '&lang=' + lang + (kind ? '&kind=' + kind : '');
-      const { xml, networkOk } = await fetchTimedtextRaw(tUrl);
-      if (!networkOk) { proxyBlocked = true; break; }
-      if (xml) {
-        const transcript = parseTimedtextXml(xml) || parseJson3Transcript(xml);
-        if (transcript) return { title, transcript };
+      for (const tUrl of [base, base + '&fmt=json3', base + '&fmt=vtt']) {
+        const { xml, networkOk } = await fetchTimedtextRaw(tUrl);
+        if (!networkOk) { proxyBlocked = true; break; }
+        if (xml) {
+          const transcript = parseTimedtextXml(xml) || parseJson3Transcript(xml) || parseVttTranscript(xml);
+          if (transcript) return { title, transcript };
+        }
       }
+      if (proxyBlocked) break;
     }
     diag.push(proxyBlocked ? 'tdt:bloqueado' : 'tdt:vac\xEDo');
 
