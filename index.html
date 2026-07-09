@@ -623,13 +623,63 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     return null;
   }
 
+  async function tryPlayerEndpoint(videoId) {
+    const url = 'https://www.youtube.com/youtubei/v1/player'
+      + '?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false';
+    const body = JSON.stringify({
+      context: {
+        client: {
+          clientName: 'ANDROID',
+          clientVersion: '17.31.35',
+          androidSdkVersion: 30,
+          hl: 'en',
+          gl: 'US',
+          utcOffsetMinutes: 0,
+        }
+      },
+      videoId,
+      contentCheckOk: true,
+      racyCheckOk: true,
+    });
+    for (const proxy of POST_PROXIES) {
+      try {
+        const c = new AbortController();
+        const t = setTimeout(() => c.abort(), 20000);
+        const res = await fetch(proxy + encodeURIComponent(url), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+          signal: c.signal,
+        });
+        clearTimeout(t);
+        if (!res.ok) continue;
+        const data = await res.json();
+        const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+        if (!tracks?.length) continue;
+        const track = tracks.find(t => t.languageCode?.startsWith('es') && t.kind !== 'asr')
+          || tracks.find(t => t.languageCode?.startsWith('es'))
+          || tracks.find(t => t.kind !== 'asr')
+          || tracks[0];
+        if (!track?.baseUrl) continue;
+        for (const capUrl of [track.baseUrl + '&fmt=json3', track.baseUrl]) {
+          const text = await fetchWithProxy(capUrl).catch(() => null);
+          if (text) {
+            const tr = parseJson3Transcript(text) || parseTimedtextXml(text) || parseVttTranscript(text);
+            if (tr) return tr;
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
   async function tryInvidiousTranscript(videoId) {
     const instances = [
-      'https://invidious.snopyta.org',
-      'https://yewtu.be',
-      'https://invidious.kavin.rocks',
-      'https://inv.riverside.rocks',
-      'https://invidious.lunar.icu',
+      'https://invidious.privacydev.net',
+      'https://iv.datura.network',
+      'https://invidious.perennialte.ch',
+      'https://yt.cdaut.de',
+      'https://invidious.fdn.fr',
     ];
     for (const base of instances) {
       try {
@@ -693,6 +743,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
   async function extractTranscript(videoId) {
     const diag = [];
 
+    // Step 1: title and language via YouTube Data API
     let title = videoId;
     let primaryLang = null;
     try {
@@ -713,27 +764,41 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       }
     } catch (_) {}
 
+    // Step 2: Player endpoint (ANDROID client, returns signed captionTracks)
+    try {
+      const plr = await tryPlayerEndpoint(videoId);
+      if (plr) return { title, transcript: plr };
+      diag.push('plr:vac\xEDo');
+    } catch (_) { diag.push('plr:err'); }
+
+    // Step 3: Invidious API (open-source YouTube front-end with CORS, no proxy needed)
     try {
       const inv = await tryInvidiousTranscript(videoId);
       if (inv) return { title, transcript: inv };
       diag.push('inv:vac\xEDo');
     } catch (_) { diag.push('inv:err'); }
 
+    // Step 4: Innertube get_transcript (YouTube's own panel API)
     try {
       const inn = await tryInnertubeTranscript(videoId);
       if (inn) return { title, transcript: inn };
       diag.push('inn:vac\xEDo');
     } catch (_) { diag.push('inn:err'); }
 
+    // Step 5: Scrape YouTube page for signed caption URLs
     let signedUrl = null;
     let visitorData = null;
     for (const [label, pageUrl] of [
+      ['nocookie', 'https://www.youtube-nocookie.com/embed/' + videoId],
       ['embed', 'https://www.youtube.com/embed/' + videoId],
-      ['watch', 'https://www.youtube.com/watch?v=' + videoId],
+      ['watch', 'https://www.youtube.com/watch?v=' + videoId + '&bpctr=9999999999'],
     ]) {
       try {
         const html = await fetchWithProxy(pageUrl);
         if (html && html.length > 5000) {
+          if (html.includes('consent.youtube') || html.includes('Before you continue')) {
+            diag.push(label + ':consent'); continue;
+          }
           const vdm = /"VISITOR_DATA":"([^"]+)"/.exec(html);
           if (vdm) visitorData = vdm[1];
           const playerData = extractJsonBlock(html, 'ytInitialPlayerResponse');
@@ -751,6 +816,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       if (signedUrl) break;
     }
 
+    // Step 6: Fetch signed caption URL (+ json3 variant)
     if (signedUrl) {
       for (const url of [signedUrl, signedUrl.replace(/&fmt=[^&]*/, '') + '&fmt=json3']) {
         try {
@@ -764,6 +830,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       diag.push('cap:err');
     } else diag.push('cap:sin-url');
 
+    // Step 7: Re-try Innertube with VISITOR_DATA extracted from page
     if (visitorData) {
       try {
         const inn2 = await tryInnertubeTranscript(videoId, visitorData);
@@ -772,6 +839,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       } catch (_) { diag.push('inn2:err'); }
     }
 
+    // Step 8: Unsigned timedtext fallback
     let trackLang = primaryLang;
     let trackKind = '';
     const listUrl = 'https://www.youtube.com/api/timedtext?v=' + videoId + '&type=list';
