@@ -623,52 +623,58 @@ td.status-err { color: #ef4444; font-size: 1rem; }
     return null;
   }
 
+  function extractCaptionUrlFromHtml(html) {
+    const idx = html.indexOf('"captionTracks"');
+    if (idx === -1) return null;
+    const slice = html.slice(idx, idx + 8000);
+    const m = /"baseUrl"\s*:\s*"([^"]+)"/.exec(slice);
+    if (!m) return null;
+    const url = m[1]
+      .replace(/\\u0026/g, '&')
+      .replace(/\\u002F/g, '/')
+      .replace(/\\\//g, '/');
+    return url.includes('timedtext') ? url : null;
+  }
+
   async function tryPlayerEndpoint(videoId) {
-    const url = 'https://www.youtube.com/youtubei/v1/player'
+    const BASE_URL = 'https://www.youtube.com/youtubei/v1/player'
       + '?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false';
-    const body = JSON.stringify({
-      context: {
-        client: {
-          clientName: 'ANDROID',
-          clientVersion: '17.31.35',
-          androidSdkVersion: 30,
-          hl: 'en',
-          gl: 'US',
-          utcOffsetMinutes: 0,
-        }
-      },
-      videoId,
-      contentCheckOk: true,
-      racyCheckOk: true,
-    });
-    for (const proxy of POST_PROXIES) {
-      try {
-        const c = new AbortController();
-        const t = setTimeout(() => c.abort(), 20000);
-        const res = await fetch(proxy + encodeURIComponent(url), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body,
-          signal: c.signal,
-        });
-        clearTimeout(t);
-        if (!res.ok) continue;
-        const data = await res.json();
-        const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-        if (!tracks?.length) continue;
-        const track = tracks.find(t => t.languageCode?.startsWith('es') && t.kind !== 'asr')
-          || tracks.find(t => t.languageCode?.startsWith('es'))
-          || tracks.find(t => t.kind !== 'asr')
-          || tracks[0];
-        if (!track?.baseUrl) continue;
-        for (const capUrl of [track.baseUrl + '&fmt=json3', track.baseUrl]) {
-          const text = await fetchWithProxy(capUrl).catch(() => null);
-          if (text) {
-            const tr = parseJson3Transcript(text) || parseTimedtextXml(text) || parseVttTranscript(text);
-            if (tr) return tr;
+    const clientConfigs = [
+      { clientName: 'IOS', clientVersion: '19.09.3', deviceModel: 'iPhone14,3', osName: 'iPhone', osVersion: '16.0', hl: 'en', gl: 'US' },
+      { clientName: 'TVHTML5', clientVersion: '7.20220325', hl: 'en', gl: 'US' },
+      { clientName: 'ANDROID', clientVersion: '17.31.35', androidSdkVersion: 30, hl: 'en', gl: 'US', utcOffsetMinutes: 0 },
+    ];
+    for (const client of clientConfigs) {
+      const body = JSON.stringify({ context: { client }, videoId, contentCheckOk: true, racyCheckOk: true });
+      for (const proxy of POST_PROXIES) {
+        try {
+          const c = new AbortController();
+          const t = setTimeout(() => c.abort(), 20000);
+          const res = await fetch(proxy + encodeURIComponent(BASE_URL), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body,
+            signal: c.signal,
+          });
+          clearTimeout(t);
+          if (!res.ok) continue;
+          const data = await res.json();
+          const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+          if (!tracks?.length) continue;
+          const track = tracks.find(t => t.languageCode?.startsWith('es') && t.kind !== 'asr')
+            || tracks.find(t => t.languageCode?.startsWith('es'))
+            || tracks.find(t => t.kind !== 'asr')
+            || tracks[0];
+          if (!track?.baseUrl) continue;
+          for (const capUrl of [track.baseUrl + '&fmt=json3', track.baseUrl]) {
+            const text = await fetchWithProxy(capUrl).catch(() => null);
+            if (text) {
+              const tr = parseJson3Transcript(text) || parseTimedtextXml(text) || parseVttTranscript(text);
+              if (tr) return tr;
+            }
           }
-        }
-      } catch (_) {}
+        } catch (_) {}
+      }
     }
     return null;
   }
@@ -764,7 +770,7 @@ td.status-err { color: #ef4444; font-size: 1rem; }
       }
     } catch (_) {}
 
-    // Step 2: Player endpoint (ANDROID client, returns signed captionTracks)
+    // Step 2: Player endpoint (multiple clients, returns signed captionTracks)
     try {
       const plr = await tryPlayerEndpoint(videoId);
       if (plr) return { title, transcript: plr };
@@ -810,7 +816,12 @@ td.status-err { color: #ef4444; font-size: 1rem; }
               if (track?.baseUrl) { signedUrl = track.baseUrl; diag.push(label + ':trks=' + tracks.length); }
               else diag.push(label + ':sin-url');
             } else diag.push(label + ':sin-trks');
-          } else diag.push(label + ':pd-miss(' + Math.round(html.length / 1024) + 'K)');
+          } else {
+            // JSON parse failed — try direct regex extraction of caption URL from raw HTML
+            const captionUrl = extractCaptionUrlFromHtml(html);
+            if (captionUrl) { signedUrl = captionUrl; diag.push(label + ':regex-url'); }
+            else diag.push(label + ':pd-miss(' + Math.round(html.length / 1024) + 'K)');
+          }
         } else diag.push(label + ':html-vac\xEDo');
       } catch (_) { diag.push(label + ':err'); }
       if (signedUrl) break;
